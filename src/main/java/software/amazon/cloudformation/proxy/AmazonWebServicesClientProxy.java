@@ -21,14 +21,13 @@ import com.amazonaws.auth.AWSCredentialsProvider;
 import com.amazonaws.auth.AWSStaticCredentialsProvider;
 import com.amazonaws.auth.BasicSessionCredentials;
 import com.google.common.base.Preconditions;
-import com.google.common.util.concurrent.Uninterruptibles;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import javax.annotation.Nonnull;
@@ -40,6 +39,9 @@ import software.amazon.awssdk.awscore.AwsRequestOverrideConfiguration;
 import software.amazon.awssdk.awscore.AwsResponse;
 import software.amazon.awssdk.awscore.exception.AwsErrorDetails;
 import software.amazon.awssdk.awscore.exception.AwsServiceException;
+import software.amazon.awssdk.core.ResponseBytes;
+import software.amazon.awssdk.core.ResponseInputStream;
+import software.amazon.awssdk.core.SdkClient;
 import software.amazon.awssdk.core.exception.NonRetryableException;
 import software.amazon.awssdk.core.exception.RetryableException;
 import software.amazon.awssdk.core.pagination.sync.SdkIterable;
@@ -61,10 +63,9 @@ public class AmazonWebServicesClientProxy implements CallChain {
 
     private final AWSCredentialsProvider v1CredentialsProvider;
     private final AwsCredentialsProvider v2CredentialsProvider;
-    private final Supplier<Long> remainingTimeInMillis;
-    private final boolean inHandshakeMode;
     private final LoggerProxy loggerProxy;
     private final DelayFactory override;
+    private final WaitStrategy waitStrategy;
 
     public AmazonWebServicesClientProxy(final LoggerProxy loggerProxy,
                                         final Credentials credentials,
@@ -76,18 +77,14 @@ public class AmazonWebServicesClientProxy implements CallChain {
                                         final Credentials credentials,
                                         final Supplier<Long> remainingTimeToExecute,
                                         final DelayFactory override) {
-        this(false, loggerProxy, credentials, remainingTimeToExecute, override);
+        this(loggerProxy, credentials, override, WaitStrategy.newLocalLoopAwaitStrategy(remainingTimeToExecute));
     }
 
-    public AmazonWebServicesClientProxy(final boolean inHandshakeMode,
-                                        final LoggerProxy loggerProxy,
+    public AmazonWebServicesClientProxy(final LoggerProxy loggerProxy,
                                         final Credentials credentials,
-                                        final Supplier<Long> remainingTimeToExecute,
-                                        final DelayFactory override) {
-        this.inHandshakeMode = inHandshakeMode;
+                                        final DelayFactory override,
+                                        final WaitStrategy waitStrategy) {
         this.loggerProxy = loggerProxy;
-        this.remainingTimeInMillis = remainingTimeToExecute;
-
         BasicSessionCredentials basicSessionCredentials = new BasicSessionCredentials(credentials.getAccessKeyId(),
                                                                                       credentials.getSecretAccessKey(),
                                                                                       credentials.getSessionToken());
@@ -97,6 +94,7 @@ public class AmazonWebServicesClientProxy implements CallChain {
             credentials.getSecretAccessKey(), credentials.getSessionToken());
         this.v2CredentialsProvider = StaticCredentialsProvider.create(awsSessionCredentials);
         this.override = Objects.requireNonNull(override);
+        this.waitStrategy = Objects.requireNonNull(waitStrategy);
     }
 
     public <ClientT> ProxyClient<ClientT> newProxy(@Nonnull Supplier<ClientT> client) {
@@ -111,9 +109,32 @@ public class AmazonWebServicesClientProxy implements CallChain {
             @Override
             public <RequestT extends AwsRequest, ResponseT extends AwsResponse>
                 CompletableFuture<ResponseT>
-                injectCredentialsAndInvokeV2Aync(RequestT request,
-                                                 Function<RequestT, CompletableFuture<ResponseT>> requestFunction) {
+                injectCredentialsAndInvokeV2Async(RequestT request,
+                                                  Function<RequestT, CompletableFuture<ResponseT>> requestFunction) {
                 return AmazonWebServicesClientProxy.this.injectCredentialsAndInvokeV2Async(request, requestFunction);
+            }
+
+            @Override
+            public <RequestT extends AwsRequest, ResponseT extends AwsResponse, IterableT extends SdkIterable<ResponseT>>
+                IterableT
+                injectCredentialsAndInvokeIterableV2(RequestT request, Function<RequestT, IterableT> requestFunction) {
+                return AmazonWebServicesClientProxy.this.injectCredentialsAndInvokeIterableV2(request, requestFunction);
+            }
+
+            @Override
+            public <RequestT extends AwsRequest, ResponseT extends AwsResponse>
+                ResponseInputStream<ResponseT>
+                injectCredentialsAndInvokeV2InputStream(RequestT request,
+                                                        Function<RequestT, ResponseInputStream<ResponseT>> requestFunction) {
+                return AmazonWebServicesClientProxy.this.injectCredentialsAndInvokeV2InputStream(request, requestFunction);
+            }
+
+            @Override
+            public <RequestT extends AwsRequest, ResponseT extends AwsResponse>
+                ResponseBytes<ResponseT>
+                injectCredentialsAndInvokeV2Bytes(RequestT request,
+                                                  Function<RequestT, ResponseBytes<ResponseT>> requestFunction) {
+                return AmazonWebServicesClientProxy.this.injectCredentialsAndInvokeV2Bytes(request, requestFunction);
             }
 
             @Override
@@ -163,6 +184,12 @@ public class AmazonWebServicesClientProxy implements CallChain {
         }
 
         @Override
+        public <
+            RequestT> Caller<RequestT, ClientT, ModelT, CallbackT> translateToServiceRequest(Function<ModelT, RequestT> maker) {
+            return initiate("").translateToServiceRequest(maker);
+        }
+
+        @Override
         public ModelT getResourceModel() {
             return model;
         }
@@ -184,6 +211,11 @@ public class AmazonWebServicesClientProxy implements CallChain {
             rebindCallback(NewCallbackT callback) {
             Preconditions.checkNotNull(callback, "cxt can not be null");
             return new StdInitiator<>(client, model, callback);
+        }
+
+        @Override
+        public Logger getLogger() {
+            return AmazonWebServicesClientProxy.this.loggerProxy;
         }
     }
 
@@ -223,11 +255,28 @@ public class AmazonWebServicesClientProxy implements CallChain {
         }
 
         @Override
-        public <RequestT> Caller<RequestT, ClientT, ModelT, CallbackT> translate(Function<ModelT, RequestT> maker) {
+        public <
+            RequestT> Caller<RequestT, ClientT, ModelT, CallbackT> translateToServiceRequest(Function<ModelT, RequestT> maker) {
             return new Caller<RequestT, ClientT, ModelT, CallbackT>() {
 
+                private final CallGraphNameGenerator<ModelT, RequestT, ClientT,
+                    CallbackT> generator = (incoming, model_, reqMaker, client_, context_) -> {
+                        final RequestT request = reqMaker.apply(model_);
+                        String objectHash = String.valueOf(Objects.hashCode(request));
+                        String serviceName = (client_ == null
+                            ? ""
+                            : (client_ instanceof SdkClient)
+                                ? ((SdkClient) client_).serviceName()
+                                : client_.getClass().getSimpleName());
+                        String requestName = request != null ? request.getClass().getSimpleName().replace("Request", "") : "";
+                        String callGraph = serviceName + ":" + requestName + "-" + (incoming != null ? incoming : "") + "-"
+                            + objectHash;
+                        context_.request(callGraph, (ignored -> request)).apply(model_);
+                        return callGraph;
+                    };
+
                 @Override
-                public Caller<RequestT, ClientT, ModelT, CallbackT> backoff(Delay delay) {
+                public Caller<RequestT, ClientT, ModelT, CallbackT> backoffDelay(Delay delay) {
                     CallContext.this.delay = delay;
                     return this;
                 }
@@ -235,7 +284,7 @@ public class AmazonWebServicesClientProxy implements CallChain {
                 @Override
                 public <ResponseT>
                     Stabilizer<RequestT, ResponseT, ClientT, ModelT, CallbackT>
-                    call(BiFunction<RequestT, ProxyClient<ClientT>, ResponseT> caller) {
+                    makeServiceCall(BiFunction<RequestT, ProxyClient<ClientT>, ResponseT> caller) {
                     return new Stabilizer<RequestT, ResponseT, ClientT, ModelT, CallbackT>() {
 
                         private Callback<RequestT, ResponseT, ClientT, ModelT, CallbackT, Boolean> waitFor;
@@ -307,6 +356,8 @@ public class AmazonWebServicesClientProxy implements CallChain {
                             // stabilization
                             // lambdas. This ensures that we call demux as necessary.
                             //
+                            final String callGraph = generator.callGraph(CallContext.this.callGraph, model, maker,
+                                client.client(), context);
                             Delay delay = override.getDelay(callGraph, CallContext.this.delay);
                             Function<ModelT, RequestT> reqMaker = context.request(callGraph, maker);
                             BiFunction<RequestT, ProxyClient<ClientT>, ResponseT> resMaker = context.response(callGraph, caller);
@@ -339,14 +390,6 @@ public class AmazonWebServicesClientProxy implements CallChain {
                                         event = exceptionHandler.invoke(req, e, client, model, context);
                                     }
 
-                                    if (event != null && (event.isFailed() || event.isSuccess())) {
-                                        return event;
-                                    }
-
-                                    if (inHandshakeMode) {
-                                        return ProgressEvent.defaultInProgressHandler(context, 60, model);
-                                    }
-
                                     if (event != null) {
                                         return event;
                                     }
@@ -366,14 +409,10 @@ public class AmazonWebServicesClientProxy implements CallChain {
                                         return ProgressEvent.failed(model, context, HandlerErrorCode.NotStabilized,
                                             "Exceeded attempts to wait");
                                     }
-                                    long remainingTime = getRemainingTimeInMillis();
-                                    long localWait = next.toMillis() + 2 * elapsed + 100;
-                                    if (remainingTime > localWait) {
-                                        Uninterruptibles.sleepUninterruptibly(next.getSeconds(), TimeUnit.SECONDS);
-                                        continue;
+                                    event = AmazonWebServicesClientProxy.this.waitStrategy.await(elapsed, next, context, model);
+                                    if (event != null) {
+                                        return event;
                                     }
-                                    return ProgressEvent.defaultInProgressHandler(context, Math.max((int) next.getSeconds(), 60),
-                                        model);
                                 }
                             } finally {
                                 //
@@ -398,10 +437,6 @@ public class AmazonWebServicesClientProxy implements CallChain {
 
     }
 
-    public final long getRemainingTimeInMillis() {
-        return remainingTimeInMillis.get();
-    }
-
     public <RequestT extends AmazonWebServiceRequest, ResultT extends AmazonWebServiceResult<ResponseMetadata>>
         ResultT
         injectCredentialsAndInvoke(final RequestT request, final Function<RequestT, ResultT> requestFunction) {
@@ -409,7 +444,24 @@ public class AmazonWebServicesClientProxy implements CallChain {
         request.setRequestCredentialsProvider(v1CredentialsProvider);
 
         try {
-            return requestFunction.apply(request);
+            ResultT response = requestFunction.apply(request);
+            logRequestMetadata(request, response);
+            return response;
+        } catch (final Throwable e) {
+            loggerProxy.log(String.format("Failed to execute remote function: {%s}", e.getMessage()));
+            throw e;
+        } finally {
+            request.setRequestCredentialsProvider(null);
+        }
+    }
+
+    public <RequestT extends AmazonWebServiceRequest> void injectCredentialsAndInvoke(final RequestT request,
+                                                                                      final Consumer<RequestT> requestFunction) {
+
+        request.setRequestCredentialsProvider(v1CredentialsProvider);
+
+        try {
+            requestFunction.accept(request);
         } catch (final Throwable e) {
             loggerProxy.log(String.format("Failed to execute remote function: {%s}", e.getMessage()));
             throw e;
@@ -429,7 +481,9 @@ public class AmazonWebServicesClientProxy implements CallChain {
         RequestT wrappedRequest = (RequestT) request.toBuilder().overrideConfiguration(overrideConfiguration).build();
 
         try {
-            return requestFunction.apply(wrappedRequest);
+            ResultT response = requestFunction.apply(wrappedRequest);
+            logRequestMetadataV2(request, response);
+            return response;
         } catch (final Throwable e) {
             loggerProxy.log(String.format("Failed to execute remote function: {%s}", e.getMessage()));
             throw e;
@@ -448,7 +502,11 @@ public class AmazonWebServicesClientProxy implements CallChain {
         RequestT wrappedRequest = (RequestT) request.toBuilder().overrideConfiguration(overrideConfiguration).build();
 
         try {
-            return requestFunction.apply(wrappedRequest);
+            CompletableFuture<ResultT> response = requestFunction.apply(wrappedRequest).thenApplyAsync(resultT -> {
+                logRequestMetadataV2(request, resultT);
+                return resultT;
+            });
+            return response;
         } catch (final Throwable e) {
             loggerProxy.log(String.format("Failed to execute remote function: {%s}", e.getMessage()));
             throw e;
@@ -466,7 +524,51 @@ public class AmazonWebServicesClientProxy implements CallChain {
         RequestT wrappedRequest = (RequestT) request.toBuilder().overrideConfiguration(overrideConfiguration).build();
 
         try {
-            return requestFunction.apply(wrappedRequest);
+            IterableT response = requestFunction.apply(wrappedRequest);
+            response.forEach(r -> logRequestMetadataV2(request, r));
+            return response;
+        } catch (final Throwable e) {
+            loggerProxy.log(String.format("Failed to execute remote function: {%s}", e.getMessage()));
+            throw e;
+        }
+    }
+
+    public <RequestT extends AwsRequest, ResultT extends AwsResponse>
+        ResponseInputStream<ResultT>
+        injectCredentialsAndInvokeV2InputStream(final RequestT request,
+                                                final Function<RequestT, ResponseInputStream<ResultT>> requestFunction) {
+
+        AwsRequestOverrideConfiguration overrideConfiguration = AwsRequestOverrideConfiguration.builder()
+            .credentialsProvider(v2CredentialsProvider).build();
+
+        @SuppressWarnings("unchecked")
+        RequestT wrappedRequest = (RequestT) request.toBuilder().overrideConfiguration(overrideConfiguration).build();
+
+        try {
+            ResponseInputStream<ResultT> response = requestFunction.apply(wrappedRequest);
+            logRequestMetadataV2(request, response.response());
+            return response;
+        } catch (final Throwable e) {
+            loggerProxy.log(String.format("Failed to execute remote function: {%s}", e.getMessage()));
+            throw e;
+        }
+    }
+
+    public <RequestT extends AwsRequest, ResultT extends AwsResponse>
+        ResponseBytes<ResultT>
+        injectCredentialsAndInvokeV2Bytes(final RequestT request,
+                                          final Function<RequestT, ResponseBytes<ResultT>> requestFunction) {
+
+        AwsRequestOverrideConfiguration overrideConfiguration = AwsRequestOverrideConfiguration.builder()
+            .credentialsProvider(v2CredentialsProvider).build();
+
+        @SuppressWarnings("unchecked")
+        RequestT wrappedRequest = (RequestT) request.toBuilder().overrideConfiguration(overrideConfiguration).build();
+
+        try {
+            ResponseBytes<ResultT> response = requestFunction.apply(wrappedRequest);
+            logRequestMetadataV2(request, response.response());
+            return response;
         } catch (final Throwable e) {
             loggerProxy.log(String.format("Failed to execute remote function: {%s}", e.getMessage()));
             throw e;
@@ -486,8 +588,7 @@ public class AmazonWebServicesClientProxy implements CallChain {
         if (e instanceof AwsServiceException) {
             AwsServiceException sdkException = (AwsServiceException) e;
             AwsErrorDetails details = sdkException.awsErrorDetails();
-            String errMsg = "Exception=[" + sdkException.getClass() + "] " + "ErrorCode=[" + details.errorCode()
-                + "],  ErrorMessage=[" + details.errorMessage() + "]";
+            String errMsg = sdkException.getMessage();
             switch (details.sdkHttpResponse().statusCode()) {
                 case HttpStatusCode.BAD_REQUEST:
                     //
@@ -527,5 +628,34 @@ public class AmazonWebServicesClientProxy implements CallChain {
         }
         return ProgressEvent.failed(model, context, HandlerErrorCode.InternalFailure, e.getMessage());
 
+    }
+
+    private <RequestT extends AmazonWebServiceRequest, ResultT extends AmazonWebServiceResult<ResponseMetadata>>
+        void
+        logRequestMetadata(final RequestT request, final ResultT response) {
+        try {
+            String requestName = request.getClass().getSimpleName();
+            String requestId = (response == null || response.getSdkResponseMetadata() == null)
+                ? ""
+                : response.getSdkResponseMetadata().getRequestId();
+            loggerProxy
+                .log(String.format("{\"apiRequest\": {\"requestId\": \"%s\", \"requestName\": \"%s\"}}", requestId, requestName));
+        } catch (final Exception e) {
+            loggerProxy.log(e.getMessage());
+        }
+    }
+
+    private <RequestT extends AwsRequest, ResultT extends AwsResponse> void logRequestMetadataV2(final RequestT request,
+                                                                                                 final ResultT response) {
+        try {
+            String requestName = request.getClass().getSimpleName();
+            String requestId = (response == null || response.responseMetadata() == null)
+                ? ""
+                : response.responseMetadata().requestId();
+            loggerProxy
+                .log(String.format("{\"apiRequest\": {\"requestId\": \"%s\", \"requestName\": \"%s\"}}", requestId, requestName));
+        } catch (final Exception e) {
+            loggerProxy.log(e.getMessage());
+        }
     }
 }

@@ -31,8 +31,8 @@ import java.util.function.Function;
  *
  * <ol>
  * <li>{@link CallChain#initiate(String, ProxyClient, Object, StdCallbackContext)}
- * <li>{@link RequestMaker#translate(Function)}
- * <li>{@link Caller#call(BiFunction)}
+ * <li>{@link RequestMaker#translateToServiceRequest(Function)}
+ * <li>{@link Caller#makeServiceCall(BiFunction)}
  * <li>{@link Completed#done(Function)}
  * </ol>
  *
@@ -53,7 +53,7 @@ public interface CallChain {
      * @param <ModelT> the model object being worked on
      * @param <CallbackT> the callback context
      */
-    interface Initiator<ClientT, ModelT, CallbackT extends StdCallbackContext> {
+    interface Initiator<ClientT, ModelT, CallbackT extends StdCallbackContext> extends RequestMaker<ClientT, ModelT, CallbackT> {
         /**
          * Each service call must be first initiated. Every call is provided a separate
          * name called call graph. This is essential from both a tracing perspective as
@@ -73,6 +73,11 @@ public interface CallChain {
          * @return the callback context associated with API initiator, Can not be null
          */
         CallbackT getCallbackContext();
+
+        /**
+         * @return logger associated to log messages
+         */
+        Logger getLogger();
 
         /**
          * Can rebind a new model to the call chain while retaining the client and
@@ -144,7 +149,7 @@ public interface CallChain {
      */
     interface RequestMaker<ClientT, ModelT, CallbackT extends StdCallbackContext> {
         /**
-         * use {@link #translate(Function)}
+         * use {@link #translateToServiceRequest(Function)}
          *
          * Take a reference to the tranlater that take the resource model POJO as input
          * and provide a request object as needed to make the Service call.
@@ -155,7 +160,7 @@ public interface CallChain {
          */
         @Deprecated
         default <RequestT> Caller<RequestT, ClientT, ModelT, CallbackT> request(Function<ModelT, RequestT> maker) {
-            return translate(maker);
+            return translateToServiceRequest(maker);
         }
 
         /**
@@ -166,7 +171,7 @@ public interface CallChain {
          * @param <RequestT>, the web service request created
          * @return returns the next step, to actually call the service.
          */
-        <RequestT> Caller<RequestT, ClientT, ModelT, CallbackT> translate(Function<ModelT, RequestT> maker);
+        <RequestT> Caller<RequestT, ClientT, ModelT, CallbackT> translateToServiceRequest(Function<ModelT, RequestT> maker);
     }
 
     /**
@@ -181,16 +186,23 @@ public interface CallChain {
      *            responses
      */
     interface Caller<RequestT, ClientT, ModelT, CallbackT extends StdCallbackContext> {
+        @Deprecated
+        default <ResponseT>
+            Stabilizer<RequestT, ResponseT, ClientT, ModelT, CallbackT>
+            call(BiFunction<RequestT, ProxyClient<ClientT>, ResponseT> caller) {
+            return makeServiceCall(caller);
+        }
+
         <ResponseT>
             Stabilizer<RequestT, ResponseT, ClientT, ModelT, CallbackT>
-            call(BiFunction<RequestT, ProxyClient<ClientT>, ResponseT> caller);
+            makeServiceCall(BiFunction<RequestT, ProxyClient<ClientT>, ResponseT> caller);
 
         @Deprecated
         default Caller<RequestT, ClientT, ModelT, CallbackT> retry(Delay delay) {
-            return backoff(delay);
+            return backoffDelay(delay);
         }
 
-        Caller<RequestT, ClientT, ModelT, CallbackT> backoff(Delay delay);
+        Caller<RequestT, ClientT, ModelT, CallbackT> backoffDelay(Delay delay);
 
     }
 
@@ -214,18 +226,6 @@ public interface CallChain {
     @FunctionalInterface
     interface Callback<RequestT, ResponseT, ClientT, ModelT, CallbackT extends StdCallbackContext, ReturnT> {
         ReturnT invoke(RequestT request, ResponseT response, ProxyClient<ClientT> client, ModelT model, CallbackT context);
-
-        static <RequestT, ResponseT, ClientT, ModelT, CallbackT extends StdCallbackContext>
-            Callback<RequestT, ResponseT, ClientT, ModelT, CallbackT, ProgressEvent<ModelT, CallbackT>>
-            progress() {
-            return (r1, r2, c1, m1, c2) -> ProgressEvent.progress(m1, c2);
-        }
-
-        static <RequestT, ResponseT, ClientT, ModelT, CallbackT extends StdCallbackContext>
-            Callback<RequestT, ResponseT, ClientT, ModelT, CallbackT, ProgressEvent<ModelT, CallbackT>>
-            success() {
-            return (r1, r2, c1, m1, c2) -> ProgressEvent.success(m1, c2);
-        }
     }
 
     /**
